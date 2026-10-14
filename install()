@@ -1,0 +1,163 @@
+# ---- install() ----
+# This function checks, installs, and verifies package dependencies across multiple repositories.
+#         - Skips already-installed packages
+#         - Installs packages quietly
+#         - Tracks and displays errors after running
+#         - Accommodates required and optional packages
+
+# ---- 0. Inputs ----
+# pkg_list (nested list): Each element is a repository. Each repository requires
+#         1. installer (string): Full installer function for that repository
+#         2. args (list):  List of parameters that should be passed through the installer function
+#         3. pkgs (character vector): List of full package names that need to be installed
+#
+# is_optional (boolean): Whether the packages are required or optional for the core pipeline
+#         TRUE: Proceed to core pipeline, regardless of whether the packages are installed or not
+#         FALSE (by default): Stop code if any package is not installed
+
+install <- function(pkg_list = list(), is_optional = FALSE) {
+  
+  # Create vectors to track failed installations and diagnostic logs
+  failed_pkgs <- character()
+  diagnostic_log <- list()
+  
+  # Loop through each repository
+  for (repo in names(pkg_list)) {
+    cat(sprintf("Installing %s packages...\n", repo))
+    
+    # Extract info for current repository
+    config <- pkg_list[[repo]]
+    pkgs <- config$pkgs
+    installer <- config$installer
+    args <- config$args
+    
+    # Check if any listed packages are not installed
+    # suppressPackageStartupMessages keeps console clean of messages
+    missing_pkgs <- suppressPackageStartupMessages(
+      !vapply(basename(pkgs), requireNamespace, FUN.VALUE = logical(1), quietly = TRUE))
+    
+    # Skip to next repository if no packages are listed or need be installed from this one
+    if (length(pkgs) == 0 || !any(missing_pkgs)) next
+    
+    # ---- 1. Manager installation ----
+    manager_present <- TRUE
+    manager <- sub("::.*", "", installer) # Extract installer name
+    
+    # Install manager only if not installed
+    if (!requireNamespace(manager, quietly = TRUE)) {
+      cat(sprintf("\tInstalling %s...\n", manager))
+      
+      manager_present <- tryCatch({
+        withCallingHandlers({
+          # Trap messages for silent download
+          suppressMessages(
+            capture.output(install.packages(manager, quiet = TRUE))
+          )
+          TRUE # return TRUE if manager is installed successfully
+        }, warning = function(w) {
+          # If package does not exist, escalate warning to error
+          if (grepl("not available", conditionMessage(w))) {
+            stop(conditionMessage(w))
+          }
+          
+          # Quietly log general warnings
+          diagnostic_log[[manager]] <<- conditionMessage(w)
+          invokeRestart("muffleWarning")
+        })
+      }, error = function(e) {
+        # Catch errors
+        cat(sprintf("\t[ERROR] Failed to install %s\n", manager))
+        failed_pkgs <<- c(failed_pkgs, manager, as.character(pkgs[missing_pkgs]))
+        
+        diagnostic_log[[manager]] <<- conditionMessage(e)
+        
+        FALSE # return FALSE if manager is not installed successfully
+      })
+    }
+    
+    # Skip to next repository if manager is not installed successfully
+    if (!manager_present) next
+    
+    # ---- 2. Obtain install function ----
+    # Convert function string into executable function
+    install_fun <- tryCatch({
+      fun_name <- sub(".*::", "", installer)
+      getExportedValue(manager, fun_name) # Extract function from package namespace
+    }, error = function(e){
+      diagnostic_log[[manager]] <<- conditionMessage(e)
+      NULL
+    })
+    
+    # Skip to next repository if install function cannot be found
+    if (is.null(install_fun)) {
+      cat(sprintf("\t[ERROR] Incorrect installer syntax: %s\n", installer))
+      failed_pkgs <- c(failed_pkgs, as.character(pkgs[missing_pkgs]))
+      next
+    }
+    
+    # ---- 3. Package installation loop ----
+    for (p in pkgs) {
+      # basename cleans full package name to target name
+      if (!requireNamespace(basename(p), quietly = TRUE)){
+        cat(sprintf("\tInstalling %s...\n", basename(p)))
+        
+        tryCatch({
+          withCallingHandlers({
+            # Trap messages for silent download
+            suppressMessages(
+              capture.output(do.call(install_fun, c(list(p), args)))
+            )
+            
+          }, warning = function(w) {
+            # If package does not exist, escalate warning to error
+            if (grepl("not available", conditionMessage(w))) {
+              stop(conditionMessage(w))
+            }
+            
+            # Quietly log general warnings
+            diagnostic_log[[basename(p)]] <<- conditionMessage(w)
+            invokeRestart("muffleWarning")
+          })
+          
+          # Verify installed package is loadable
+          if (!suppressPackageStartupMessages(requireNamespace(basename(p), quietly = TRUE))) {
+            stop(sprintf("Package %s cannot be loaded into memory", basename(p)))
+          }
+          
+        }, error = function(e) {
+          # Catch errors
+          cat(sprintf("\t[ERROR] Failed to install %s\n", basename(p)))
+          failed_pkgs <<- c(failed_pkgs, basename(p))
+          
+          diagnostic_log[[basename(p)]] <<- conditionMessage(e)
+        })
+      }
+    }
+  }
+  
+  # ---- 4. Final report ----
+  if (length(failed_pkgs) == 0) {
+    cat("\nPackage installation complete.\n")
+  } else {
+    cat("\nPackage installation incomplete. The following installations failed:\n")
+    cat(sprintf("\t%s\n", failed_pkgs))
+  }
+  
+  # Print diagnostic logs of error and warnings
+  if (length(diagnostic_log) > 0) {
+    cat("\n----SYSTEM DIAGNOSTICS----\n")
+    for (error in names(diagnostic_log)) {
+      cat(sprintf("\n[%s] %s\n", error, diagnostic_log[[error]]))
+    }
+    cat("\n--------------------------\n")
+  }
+  
+  # Stop pipeline if any required packages were not installed
+  if (length(failed_pkgs) > 0) {
+    if (is_optional){
+      cat("\nOptional packages not installed. Proceeding to core pipeline...\n")
+    } else {
+      stop("Please resolve these issues before running the core pipeline.\n")
+    }
+  }
+}
